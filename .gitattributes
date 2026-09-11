@@ -1,0 +1,22 @@
+# MUHIM: launcher modullarni sha256 bo'yicha tekshiradi.
+#
+# Agar Git satr oxirini CRLF ga o'zgartirsa, make_manifest.py ishchi
+# nusxadan (CRLF) hash hisoblaydi, raw.githubusercontent.com esa saqlangan
+# holatini (LF) beradi -> hash mos kelmaydi -> launcher HAMMA modulni rad
+# etadi va dastur eski keshda qotib qoladi.
+#
+# Shuning uchun yuklanadigan barcha fayl LF da qat'iy ushlab turiladi.
+*.py    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# .bat launcher tomonidan yuklanmaydi - Windows uchun CRLF qulayroq
+*.bat   text eol=crlf
+
+# Ikkilik fayllar
+*.xls   binary
+*.xlsx  binary
+*.exe   binary
+*.db    binary
