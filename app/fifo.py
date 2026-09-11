@@ -1,0 +1,434 @@
+# -*- coding: utf-8 -*-
+"""
+bh_fifo - import, FIFO taqsimot, tekshiruv.
+
+Eski hisobotdagi ikkita asosiy nuqson shu modulda hal qilinadi:
+
+  1. YILLARARO QOLDIQ O'TMAGAN. Tekshirilgan: 2023-2026 varaqlarining
+     hammasida "давр бошига қолдиқ" nol. Bu yerda partiya (stock_lot)
+     yillardan o'tib ketaveradi, hisobot esa har yil uchun kesimni
+     hisoblab beradi.
+
+  2. MANFIY QOLDIQ. Eski faylda 2023 r25: kirim 2 dona, chiqim 5 dona,
+     qoldiq -3. 2026 jami qoldiq -6 372.92 dona. Bu yerda FIFO omborda
+     bori qadar yechadi, yetmagani ALOHIDA belgilanadi va buxgalterga
+     ko'rsatiladi - jimgina manfiyga tushmaydi.
+"""
+
+import datetime
+from decimal import Decimal
+
+import bh_config as C
+import bh_db as DB
+import bh_matching as M
+
+ZERO = Decimal("0")
+
+
+# ===========================================================================
+# Import
+# ===========================================================================
+def import_parsed(cx, engine, parsed, source_file_id, on_issue=None):
+    """
+    Parserdan kelgan hujjatlarni bazaga yozadi.
+    (yangi_hujjat, otkazib_yuborilgan, satr) qaytaradi.
+    """
+    added = skipped = nlines = 0
+
+    for doc in parsed["documents"]:
+        ex = cx.execute("SELECT id FROM document WHERE doc_key=?",
+                        (doc["doc_key"],)).fetchone()
+        if ex:
+            skipped += 1
+            DB.add_issue(cx, doc.get("doc_year"), C.SEVERITY_INFO, "duplicate_doc",
+                         "Hujjat allaqachon kiritilgan: %s" % (doc.get("doc_no") or "?"),
+                         "document", ex["id"])
+            continue
+
+        cur = cx.execute(
+            "INSERT INTO document(source_file_id,kind,doc_key,doc_no,doc_date,doc_year,"
+            "contract_no,contract_date,partner_name,partner_tin,pos_id,check_type,"
+            "total_net,total_vat,total_gross,is_return) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (source_file_id, doc["kind"], doc["doc_key"], doc.get("doc_no"),
+             doc.get("doc_date"), doc.get("doc_year"), doc.get("contract_no"),
+             doc.get("contract_date"), doc.get("partner_name"), doc.get("partner_tin"),
+             doc.get("pos_id"), doc.get("check_type"),
+             str(doc.get("total_net") or 0), str(doc.get("total_vat") or 0),
+             str(doc.get("total_gross") or 0), int(doc.get("is_return") or 0)),
+        )
+        did = cur.lastrowid
+        added += 1
+
+        # Chek jami satrlar yig'indisiga to'g'ri keldimi?
+        if doc["kind"] == "chiqim" and "_check_total" in doc:
+            ct = C.money(doc["_check_total"])
+            ls = C.money(doc["_lines_sum"])
+            if ct and abs(ct - ls) > Decimal("1"):
+                DB.add_issue(
+                    cx, doc.get("doc_year"), C.SEVERITY_WARN, "check_total_mismatch",
+                    "Chek №%s: satrlar yig'indisi %s, chek jami %s (farq %s)"
+                    % (doc.get("doc_no"), ls, ct, ls - ct), "document", did)
+
+        for ln in doc["lines"]:
+            if doc["kind"] == "kirim":
+                pid = engine.ensure_product(ln)
+                meth, score = "kirim", 1.0
+            else:
+                pid, meth, score, _ = engine.match(ln)
+                if pid and score < M.AUTO_ACCEPT_SCORE:
+                    pid = None
+                if not pid:
+                    meth, score = "", 0.0
+
+            cx.execute(
+                "INSERT INTO doc_line(document_id,kind,line_no,raw_name,norm_name,mxik,"
+                "mxik_name,barcode,marking_code,is_marked,unit_raw,unit,packaging,qty,"
+                "unit_price_net,amount_net,vat_amount,amount_gross,unit_price_gross,"
+                "product_id,match_method,match_score,line_date) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (did, doc["kind"], ln.get("line_no"), ln.get("raw_name"),
+                 ln.get("norm_name"), ln.get("mxik"), ln.get("mxik_name"),
+                 ln.get("barcode"),
+                 ln.get("marking_code"),
+                 None if ln.get("is_marked") is None else int(ln["is_marked"]),
+                 ln.get("unit_raw"), ln.get("unit"), ln.get("packaging"),
+                 str(ln.get("qty") or 0), str(ln.get("unit_price_net") or 0),
+                 str(ln.get("amount_net") or 0), str(ln.get("vat_amount") or 0),
+                 str(ln.get("amount_gross") or 0),
+                 None if ln.get("unit_price_gross") is None
+                 else str(ln["unit_price_gross"]),
+                 pid, meth, float(score),
+                 ln.get("line_date") or doc.get("doc_date")),
+            )
+            nlines += 1
+
+    return added, skipped, nlines
+
+
+# ===========================================================================
+# Ombor qayta qurish (FIFO)
+# ===========================================================================
+def rebuild_stock(cx, progress=None):
+    """
+    stock_lot va allocation jadvallarini noldan qayta quradi.
+
+    Tartib: BARCHA kirimlar va chiqimlar sana bo'yicha aralash tartibda
+    qayta o'ynatiladi - shuning uchun yil chegarasi hech qanday ahamiyatga
+    ega emas, qoldiq o'z-o'zidan o'tadi.
+    """
+    cx.execute("DELETE FROM allocation")
+    cx.execute("DELETE FROM stock_lot")
+    DB.clear_issues(cx, codes=["no_stock", "negative_cost", "negative_qty",
+                               "unmatched_sale", "unit_mismatch"])
+
+    rows = cx.execute("""
+        SELECT l.id, l.kind, l.product_id, l.qty, l.unit_price_net,
+               l.amount_net, l.amount_gross, l.raw_name, l.unit,
+               COALESCE(l.line_date, d.doc_date) AS dt,
+               d.doc_year, d.doc_no, d.partner_tin, d.is_return
+        FROM doc_line l JOIN document d ON d.id = l.document_id
+        WHERE l.product_id IS NOT NULL
+        ORDER BY COALESCE(l.line_date, d.doc_date) IS NULL,
+                 COALESCE(l.line_date, d.doc_date),
+                 CASE l.kind WHEN 'kirim' THEN 0 ELSE 1 END,
+                 l.id
+    """).fetchall()
+
+    total = len(rows)
+    # product_id -> ochiq partiyalar ro'yxati [ [lot_id, qty_left, unit_cost], ... ]
+    open_lots = {}
+    last_cost = {}
+    n_alloc = n_short = 0
+
+    for i, r in enumerate(rows):
+        pid = r["product_id"]
+        q = DB.D(r["qty"])
+        dt = r["dt"] or ""
+        year = r["doc_year"]
+
+        if r["kind"] == "kirim":
+            if q <= 0:
+                DB.add_issue(cx, year, C.SEVERITY_WARN, "negative_qty",
+                             "Kirim miqdori musbat emas: %s (%s)" % (q, r["raw_name"]),
+                             "doc_line", r["id"])
+                continue
+            cost = DB.D(r["unit_price_net"])
+            if cost < 0:
+                DB.add_issue(cx, year, C.SEVERITY_ERROR, "negative_cost",
+                             "Manfiy tannarx %s: %s" % (cost, r["raw_name"]),
+                             "doc_line", r["id"])
+                cost = -cost
+            if cost == 0:
+                DB.add_issue(cx, year, C.SEVERITY_WARN, "missing_price",
+                             "Kirim narxi nol: %s" % r["raw_name"], "doc_line", r["id"])
+            markup = DB.get_markup(cx, year or 0, r["product_id"] and None, r["partner_tin"])
+            cur = cx.execute(
+                "INSERT INTO stock_lot(product_id,doc_line_id,lot_date,lot_year,"
+                "qty_in,qty_left,unit_cost,markup,is_opening,source_year) "
+                "VALUES(?,?,?,?,?,?,?,?,0,?)",
+                (pid, r["id"], dt, year, str(q), str(q), str(cost), str(markup), year))
+            open_lots.setdefault(pid, []).append([cur.lastrowid, q, cost])
+            last_cost[pid] = cost
+            continue
+
+        # --- chiqim ---
+        if q == 0:
+            continue
+        if q < 0:
+            # Qaytarish: tovar omborga qaytadi (eng oxirgi tannarx bilan)
+            back = -q
+            cost = last_cost.get(pid) or ZERO
+            cur = cx.execute(
+                "INSERT INTO stock_lot(product_id,doc_line_id,lot_date,lot_year,"
+                "qty_in,qty_left,unit_cost,markup,is_opening,source_year) "
+                "VALUES(?,?,?,?,?,?,?,?,0,?)",
+                (pid, r["id"], dt, year, str(back), str(back), str(cost),
+                 str(DB.get_markup(cx, year or 0)), year))
+            open_lots.setdefault(pid, []).insert(0, [cur.lastrowid, back, cost])
+            continue
+
+        need = q
+        lots = open_lots.get(pid, [])
+        while need > 0 and lots:
+            lot = lots[0]
+            take = lot[1] if lot[1] <= need else need
+            if take > 0:
+                cx.execute(
+                    "INSERT INTO allocation(sale_line_id,stock_lot_id,product_id,"
+                    "alloc_date,alloc_year,qty,unit_cost,cost_amount,shortfall) "
+                    "VALUES(?,?,?,?,?,?,?,?,0)",
+                    (r["id"], lot[0], pid, dt, year, str(C.qty(take)),
+                     str(lot[2]), str(C.money(take * lot[2]))))
+                n_alloc += 1
+                lot[1] -= take
+                need -= take
+                cx.execute("UPDATE stock_lot SET qty_left=? WHERE id=?",
+                           (str(C.qty(lot[1])), lot[0]))
+            if lot[1] <= 0:
+                lots.pop(0)
+
+        if need > 0:
+            # Omborda yo'q. MANFIYGA TUSHIRMAYMIZ - belgilab qo'yamiz.
+            est = last_cost.get(pid)
+            if est is None:
+                gross = DB.D(r["amount_gross"])
+                mk = DB.get_markup(cx, year or 0)
+                est = C.money(C.net_from_gross(gross / q if q else 0) / (1 + mk)) \
+                    if q else ZERO
+            cx.execute(
+                "INSERT INTO allocation(sale_line_id,stock_lot_id,product_id,"
+                "alloc_date,alloc_year,qty,unit_cost,cost_amount,shortfall) "
+                "VALUES(?,NULL,?,?,?,?,?,?,1)",
+                (r["id"], pid, dt, year, str(C.qty(need)), str(est),
+                 str(C.money(need * est))))
+            n_short += 1
+            DB.add_issue(
+                cx, year, C.SEVERITY_ERROR, "no_stock",
+                "%s: %s dona sotilgan, lekin omborda yo'q (kirim hujjati yetishmaydi). "
+                "Tannarx taxminiy: %s" % ((r["raw_name"] or "?")[:60], C.qty(need), est),
+                "doc_line", r["id"])
+
+        if progress and (i % 200 == 0 or i == total - 1):
+            progress(i + 1, total)
+
+    return {"lines": total, "allocations": n_alloc, "shortfalls": n_short}
+
+
+# ===========================================================================
+# Yil kesimi - hisobot uchun
+# ===========================================================================
+def year_rows(cx, year):
+    """
+    Hisobotning "YYYY ТХ" varag'i uchun satrlar.
+
+    Har satr = bitta kirim partiyasi (eski fayldagi kabi: bir mahsulot
+    bir necha marta uchraydi, har kirim sanasi bilan).
+
+    Har partiya uchun yil kesimi:
+        boshiga qoldiq = qty_in (agar partiya yildan OLDIN kelgan bo'lsa)
+                         minus yil boshigacha yechilgani
+        kirim          = qty_in (agar partiya SHU yilda kelgan bo'lsa)
+        chiqim         = shu yil ichida yechilgani
+        oxiriga qoldiq = boshiga + kirim - chiqim
+    """
+    y0 = "%d-01-01" % year
+    y1 = "%d-12-31" % year
+
+    lots = cx.execute("""
+        SELECT s.id, s.product_id, s.doc_line_id, s.lot_date, s.lot_year,
+               s.qty_in, s.unit_cost, s.markup,
+               p.canon_name, p.mxik, p.mxik_name, p.unit AS punit, p.markup AS pmarkup,
+               l.raw_name, l.unit_raw, l.unit, l.packaging, l.is_marked,
+               l.marking_code, l.mxik AS lmxik, l.mxik_name AS lmxik_name
+        FROM stock_lot s
+        JOIN product p ON p.id = s.product_id
+        LEFT JOIN doc_line l ON l.id = s.doc_line_id
+        WHERE s.lot_date <= ?
+        ORDER BY s.lot_date, s.id
+    """, (y1,)).fetchall()
+
+    # partiya -> (yil boshigacha yechilgan, shu yil yechilgan)
+    before = {}
+    during = {}
+    for r in cx.execute(
+            "SELECT stock_lot_id, alloc_date, SUM(CAST(qty AS REAL)) q "
+            "FROM allocation WHERE stock_lot_id IS NOT NULL GROUP BY stock_lot_id, alloc_date"):
+        lid, d, q = r["stock_lot_id"], r["alloc_date"] or "", DB.D(r["q"])
+        if d < y0:
+            before[lid] = before.get(lid, ZERO) + q
+        elif d <= y1:
+            during[lid] = during.get(lid, ZERO) + q
+
+    # shu yilda partiyadan sotilgan summa (sotish narxida, QQS bilan)
+    sale_gross = {}
+    for r in cx.execute("""
+            SELECT a.stock_lot_id lot, a.qty aq, l.unit_price_gross upg,
+                   l.qty lq, l.amount_gross ag
+            FROM allocation a JOIN doc_line l ON l.id = a.sale_line_id
+            WHERE a.stock_lot_id IS NOT NULL AND a.alloc_date >= ? AND a.alloc_date <= ?
+        """, (y0, y1)):
+        aq = DB.D(r["aq"])
+        upg = DB.D(r["upg"]) if r["upg"] is not None else None
+        if upg is None:
+            lq = DB.D(r["lq"])
+            upg = (DB.D(r["ag"]) / lq) if lq else ZERO
+        sale_gross[r["lot"]] = sale_gross.get(r["lot"], ZERO) + C.money(aq * upg)
+
+    default_markup = DB.get_markup(cx, year)
+    out = []
+    for r in lots:
+        lot_id = r["id"]
+        qin_total = DB.D(r["qty_in"])
+        cost = DB.D(r["unit_cost"])
+        b = before.get(lot_id, ZERO)
+        d = during.get(lot_id, ZERO)
+
+        is_this_year = (r["lot_date"] or "")[:4] == str(year)
+        if is_this_year:
+            open_q = ZERO
+            in_q = qin_total
+        else:
+            open_q = qin_total - b
+            in_q = ZERO
+            if open_q <= 0 and d == 0:
+                continue          # yil boshiga ham, ichida ham hech narsa yo'q
+
+        out_q = d
+        close_q = open_q + in_q - out_q
+        if open_q == 0 and in_q == 0 and out_q == 0:
+            continue
+
+        markup = DB.D(r["pmarkup"]) if r["pmarkup"] else (
+            DB.D(r["markup"]) if r["markup"] else default_markup)
+        sale_price = C.sale_price_from_cost(cost, markup)
+
+        unit_raw = r["unit_raw"] or r["punit"] or ""
+        mxik = r["lmxik"] or r["mxik"] or ""
+        mxik_name = r["lmxik_name"] or r["mxik_name"] or ""
+
+        out.append({
+            "lot_id": lot_id,
+            "product_id": r["product_id"],
+            "date": r["lot_date"],
+            "name": r["raw_name"] or r["canon_name"],
+            "is_marked": r["is_marked"],
+            "marking_code": r["marking_code"] or "",
+            "mxik": mxik,
+            "mxik_name": mxik_name,
+            "unit": unit_raw,
+            "sale_price": sale_price,
+            "markup": markup,
+            "cost": cost,
+            "open_qty": C.qty(open_q), "open_sum": C.money(open_q * cost),
+            "in_qty": C.qty(in_q), "in_sum": C.money(in_q * cost),
+            "out_qty": C.qty(out_q), "out_sum": C.money(out_q * cost),
+            "close_qty": C.qty(close_q), "close_sum": C.money(close_q * cost),
+            "sale_qty": C.qty(out_q),
+            "sale_sum": C.money(sale_gross.get(lot_id, ZERO)),
+        })
+
+    # Omborsiz sotilganlar (kirim hujjati yo'q) - alohida satr sifatida
+    for r in cx.execute("""
+            SELECT a.product_id, a.alloc_date, SUM(CAST(a.qty AS REAL)) q,
+                   AVG(CAST(a.unit_cost AS REAL)) c, p.canon_name, p.mxik,
+                   p.mxik_name, p.unit
+            FROM allocation a JOIN product p ON p.id=a.product_id
+            WHERE a.shortfall=1 AND a.alloc_date >= ? AND a.alloc_date <= ?
+            GROUP BY a.product_id
+        """, (y0, y1)):
+        q = DB.D(r["q"])
+        cost = DB.D(r["c"])
+        out.append({
+            "lot_id": None, "product_id": r["product_id"], "date": r["alloc_date"],
+            "name": r["canon_name"], "is_marked": None, "marking_code": "",
+            "mxik": r["mxik"] or "", "mxik_name": r["mxik_name"] or "",
+            "unit": r["unit"] or "",
+            "sale_price": C.sale_price_from_cost(cost, default_markup),
+            "markup": default_markup, "cost": cost,
+            "open_qty": ZERO, "open_sum": ZERO,
+            "in_qty": ZERO, "in_sum": ZERO,
+            "out_qty": C.qty(q), "out_sum": C.money(q * cost),
+            "close_qty": C.qty(-q), "close_sum": C.money(-q * cost),
+            "sale_qty": C.qty(q),
+            "sale_sum": C.money(q * C.sale_price_from_cost(cost, default_markup)),
+            "shortfall": True,
+        })
+
+    out.sort(key=lambda x: (x["date"] or "", x["name"] or ""))
+    return out
+
+
+def year_totals(rows):
+    def s(k):
+        return sum((DB.D(r[k]) for r in rows), ZERO)
+    return {
+        "open_sum": C.money(s("open_sum")), "in_sum": C.money(s("in_sum")),
+        "out_sum": C.money(s("out_sum")), "close_sum": C.money(s("close_sum")),
+        "sale_sum": C.money(s("sale_sum")),
+        "open_qty": C.qty(s("open_qty")), "in_qty": C.qty(s("in_qty")),
+        "out_qty": C.qty(s("out_qty")), "close_qty": C.qty(s("close_qty")),
+        "profit": C.money(C.net_from_gross(s("sale_sum")) - s("out_sum")),
+        "rows": len(rows),
+    }
+
+
+# ===========================================================================
+# Tekshiruv
+# ===========================================================================
+def validate_year(cx, year):
+    """Hisobot oldidan mantiqiy tekshiruvlar."""
+    DB.clear_issues(cx, year=year, codes=["wrong_year", "bad_date", "unit_mismatch"])
+
+    for r in cx.execute(
+            "SELECT id, doc_no, doc_date, doc_year, kind FROM document "
+            "WHERE doc_date IS NULL OR doc_date=''"):
+        DB.add_issue(cx, year, C.SEVERITY_WARN, "bad_date",
+                     "Hujjat sanasi o'qilmadi: %s (%s)" % (r["doc_no"], r["kind"]),
+                     "document", r["id"])
+
+    for r in cx.execute(
+            "SELECT d.id, d.doc_no, d.doc_date, d.doc_year FROM document d "
+            "WHERE d.doc_year IS NOT NULL AND substr(d.doc_date,1,4) <> CAST(d.doc_year AS TEXT)"):
+        DB.add_issue(cx, year, C.SEVERITY_WARN, "wrong_year",
+                     "Hujjat №%s sanasi %s, lekin %d yilga yozilgan"
+                     % (r["doc_no"], r["doc_date"], r["doc_year"]), "document", r["id"])
+
+    for r in cx.execute("""
+            SELECT p.id, p.canon_name, COUNT(DISTINCT l.unit) n,
+                   GROUP_CONCAT(DISTINCT l.unit) units
+            FROM doc_line l JOIN product p ON p.id=l.product_id
+            WHERE l.unit IS NOT NULL AND l.unit<>''
+            GROUP BY p.id HAVING n > 1"""):
+        DB.add_issue(cx, year, C.SEVERITY_WARN, "unit_mismatch",
+                     "%s: o'lchov birligi har xil (%s)"
+                     % (r["canon_name"][:60], r["units"]), "product", r["id"])
+
+    n = cx.execute(
+        "SELECT COUNT(*) c FROM doc_line l JOIN document d ON d.id=l.document_id "
+        "WHERE l.kind='chiqim' AND l.product_id IS NULL AND d.doc_year=?",
+        (year,)).fetchone()["c"]
+    if n:
+        DB.add_issue(cx, year, C.SEVERITY_ERROR, "unmatched_sale",
+                     "%d ta sotuv satri kirimga bog'lanmagan - tannarx aniqlanmaydi" % n)
+    return DB.issue_counts(cx, year)
