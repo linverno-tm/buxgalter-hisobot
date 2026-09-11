@@ -142,23 +142,36 @@ def resolve_fresh_base(log):
     if base_url() != DEFAULT_BASE_URL:
         return base_url(), None          # qo'lda boshqa manzil ko'rsatilgan
 
-    try:
+    import re
+
+    def from_api():
+        raw = http_get(
+            "https://api.github.com/repos/%s/%s/commits/%s"
+            % (REPO_OWNER, REPO_NAME, REPO_BRANCH), timeout=REF_TIMEOUT)
+        return json.loads(raw.decode("utf-8"))["sha"]
+
+    def from_atom():
         feed = http_get(
             "https://github.com/%s/%s/commits/%s.atom"
             % (REPO_OWNER, REPO_NAME, REPO_BRANCH),
-            timeout=REF_TIMEOUT,
-        ).decode("utf-8", "replace")
-        import re
+            timeout=REF_TIMEOUT).decode("utf-8", "replace")
         m = re.search(r"/commit/([0-9a-f]{40})", feed)
-        if m:
-            sha = m.group(1)
-            log("  commit: %s (eng so'nggi)" % sha[:12])
-            return ("https://raw.githubusercontent.com/%s/%s/%s"
-                    % (REPO_OWNER, REPO_NAME, sha)), sha
-    except Exception as e:
-        log("  commit aniqlanmadi (%s), branch manzili ishlatiladi"
-            % type(e).__name__)
+        return m.group(1) if m else None
 
+    # API keshlanmaydi (eng ishonchli), lekin soatiga 60 so'rov bilan
+    # cheklangan. Atom'da chegara yo'q, lekin CDN'da qisqa muddat
+    # keshlanishi mumkin. Shuning uchun avval API, keyin atom.
+    for name, fn in (("api", from_api), ("atom", from_atom)):
+        try:
+            sha = fn()
+            if sha and re.match(r"^[0-9a-f]{40}$", sha):
+                log("  commit: %s (%s)" % (sha[:12], name))
+                return ("https://raw.githubusercontent.com/%s/%s/%s"
+                        % (REPO_OWNER, REPO_NAME, sha)), sha
+        except Exception as e:
+            log("  commit %s orqali aniqlanmadi (%s)" % (name, type(e).__name__))
+
+    log("  branch manzili ishlatiladi (5 daqiqagacha kechikishi mumkin)")
     return base_url(), None
 
 
