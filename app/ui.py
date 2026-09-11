@@ -675,6 +675,7 @@ class App:
         self._last_report = None
 
         root.title("%s - %s" % (C.APP_TITLE, C.VERSION))
+        self._set_window_icon()
         self._setup_geometry()
         self._build()
         self.worker = Worker(root, self._on_progress, self._on_done, self._on_error)
@@ -709,6 +710,29 @@ class App:
                 self.scan_folders()
             except Exception:
                 pass
+
+    def _set_window_icon(self):
+        """
+        Oyna sarlavhasi va vazifalar panelidagi belgi.
+
+        .exe ga --icon bilan o'rnatilgan belgi jarayonga tegishli, lekin
+        tkinter oynasi o'zining Tk patini ko'rsatib qolishi mumkin.
+        Shuning uchun .ico ni aniq belgilaymiz. Topilmasa - jimgina
+        o'tkazib yuboriladi (dastur bundan to'xtamaydi).
+        """
+        for d in (getattr(sys, "_MEIPASS", None),
+                  os.path.dirname(os.path.abspath(sys.executable)),
+                  os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+            if not d:
+                continue
+            p = os.path.join(d, "icon.ico")
+            try:
+                if os.path.isfile(p):
+                    self.root.iconbitmap(default=p)
+                    return p
+            except Exception:
+                continue
+        return None
 
     # -- 3-qoida: oyna ekranga sig'adigan qilib ochiladi -----------------
     def _setup_geometry(self):

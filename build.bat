@@ -34,6 +34,7 @@ pyinstaller --onefile --windowed --clean ^
   --icon "icon.ico" ^
   --add-data "app;app" ^
   --add-data "manifest.json;." ^
+  --add-data "icon.ico;." ^
   --hidden-import openpyxl      --collect-all openpyxl ^
   --hidden-import xlrd          --collect-all xlrd ^
   --hidden-import xlsxwriter    --collect-all xlsxwriter ^
