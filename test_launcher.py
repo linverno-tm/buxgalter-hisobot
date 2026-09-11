@@ -8,6 +8,11 @@ L = importlib.util.module_from_spec(spec); spec.loader.exec_module(L)
 L.DEFAULT_BASE_URL = "https://raw.githubusercontent.com/___yoq___/___yoq___/main"
 L.REPO_OWNER = "___yoq___"; L.REPO_NAME = "___yoq___"
 L.REF_TIMEOUT = 2
+
+# Test aniq natija bersin: keshni tozalaymiz, aks holda oldingi ishga
+# tushirishdan qolgan nusxa "zaxira" o'rniga "kesh" deb qaytadi.
+import shutil
+shutil.rmtree(L.cache_dir(), ignore_errors=True)
 L.NETWORK_TIMEOUT = 2
 os.environ.pop('BH_UPDATE_URL', None)
 
