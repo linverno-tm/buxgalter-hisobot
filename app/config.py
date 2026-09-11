@@ -11,7 +11,7 @@ import re
 import unicodedata
 from decimal import Decimal, ROUND_HALF_UP
 
-VERSION = "2026.09.11-2"
+VERSION = "2026.09.11-3"
 APP_TITLE = "Buxgalteriya hisoboti generatori"
 SCHEMA_VERSION = 1
 
