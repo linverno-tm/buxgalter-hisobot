@@ -8,3 +8,7 @@ dist/
 *.db-shm
 seed_real.py
 update_url.txt
+icon_variants.png
+icon_A.ico
+icon_B.ico
+icon_C.ico

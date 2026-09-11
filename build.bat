@@ -31,6 +31,7 @@ REM  .exe ichida nima bo'lsa - shu. Kerak bo'lmasa ham qo'shib qo'ying.
 REM
 pyinstaller --onefile --windowed --clean ^
   --name BuxgalterHisobot ^
+  --icon "icon.ico" ^
   --add-data "app;app" ^
   --add-data "manifest.json;." ^
   --hidden-import openpyxl      --collect-all openpyxl ^

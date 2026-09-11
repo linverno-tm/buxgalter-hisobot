@@ -463,6 +463,109 @@ def enable_file_drop(widget, callback):
     return None
 
 
+# ===========================================================================
+# Ish stoli yorlig'i ("o'rnatish")
+# ===========================================================================
+def app_exe_path():
+    """
+    Yorliq ko'rsatadigan fayl.
+
+    .exe sifatida ishlayotgan bo'lsa - o'sha .exe. Ishlab chiqish rejimida
+    (oddiy python) yorliq yasashning ma'nosi yo'q - None qaytadi.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    return None
+
+
+def _ps_quote(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def create_shortcut(target, link_path, description="", icon=None):
+    """
+    Windows yorlig'ini (.lnk) yaratadi.
+
+    pywin32 kerak emas - PowerShell'ning WScript.Shell obyekti ishlatiladi,
+    shuning uchun .exe ichiga qo'shimcha kutubxona o'ralmaydi.
+    """
+    import subprocess
+
+    os.makedirs(os.path.dirname(link_path), exist_ok=True)
+    ps = (
+        "$s = New-Object -ComObject WScript.Shell; "
+        "$l = $s.CreateShortcut(%s); "
+        "$l.TargetPath = %s; "
+        "$l.WorkingDirectory = %s; "
+        "$l.Description = %s; "
+        % (_ps_quote(link_path), _ps_quote(target),
+           _ps_quote(os.path.dirname(target)), _ps_quote(description))
+    )
+    if icon:
+        ps += "$l.IconLocation = %s; " % _ps_quote(icon)
+    ps += "$l.Save()"
+
+    flags = 0x08000000 if sys.platform.startswith("win") else 0   # oyna chiqmasin
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive",
+         "-ExecutionPolicy", "Bypass", "-Command", ps],
+        capture_output=True, text=True, creationflags=flags, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "").strip()[:400])
+    return link_path
+
+
+def desktop_dir():
+    """Ish stoli papkasi. OneDrive'ga ko'chirilgan bo'lsa ham topadi."""
+    import subprocess
+
+    try:
+        flags = 0x08000000 if sys.platform.startswith("win") else 0
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Environment]::GetFolderPath('Desktop')"],
+            capture_output=True, text=True, creationflags=flags, timeout=20)
+        p = (r.stdout or "").strip()
+        if p and os.path.isdir(p):
+            return p
+    except Exception:
+        pass
+    for cand in (os.path.join(os.path.expanduser("~"), "OneDrive", "Desktop"),
+                 os.path.join(os.path.expanduser("~"), "Desktop")):
+        if os.path.isdir(cand):
+            return cand
+    return os.path.expanduser("~")
+
+
+def install_shortcuts(title=None):
+    """
+    Ish stoliga va Boshlash menyusiga yorliq qo'yadi.
+
+    Yaratilgan yo'llar ro'yxatini qaytaradi. .exe emas bo'lsa - bo'sh ro'yxat.
+    """
+    exe = app_exe_path()
+    if not exe or not sys.platform.startswith("win"):
+        return []
+
+    title = title or C.APP_TITLE
+    made = []
+    targets = [
+        os.path.join(desktop_dir(), "%s.lnk" % title),
+        os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
+                     "Microsoft", "Windows", "Start Menu", "Programs",
+                     "%s.lnk" % title),
+    ]
+    for link in targets:
+        try:
+            create_shortcut(exe, link,
+                            description="Faktura va kassa cheklaridan hisobot",
+                            icon="%s,0" % exe)
+            made.append(link)
+        except Exception:
+            continue
+    return made
+
+
 def expand_inputs(paths):
     """
     Tashlangan yoki tanlangan narsalarni fayl ro'yxatiga aylantiradi.
@@ -580,6 +683,25 @@ class App:
         # Papkalar oldin ko'rsatilgan bo'lsa - darrov skanerlaymiz, buxgalter
         # har safar qo'lda bosmasin.
         root.after(120, self._startup_scan)
+        root.after(400, self._first_run_setup)
+
+    def _first_run_setup(self):
+        """
+        Birinchi ochilishda ish stoliga yorliq qo'yadi.
+
+        Buxgalter .exe ni qayerga qo'yganini eslab o'tirmasin - yorliq
+        ko'rinib tursin. Faqat BIR MARTA bajariladi; foydalanuvchi yorliqni
+        o'chirsa qayta tiklanmaydi.
+        """
+        if DB.get_setting(self.cx, "shortcuts_installed"):
+            return
+        try:
+            made = install_shortcuts()
+        except Exception:
+            made = []
+        DB.set_setting(self.cx, "shortcuts_installed", True)
+        if made:
+            self.set_status("Ish stoliga yorliq qo'yildi")
 
     def _startup_scan(self):
         if (self.var_fak.get().strip() or self.var_chq.get().strip()):
@@ -1025,6 +1147,17 @@ class App:
         brow.add(ttk.Button(brow, text="Hammasini o'chirish", style="Ghost.TButton",
                             command=self.do_reset), "left")
 
+        c4, i4 = card(pad, "Yorliqlar")
+        c4.pack(fill="x", pady=(10, 0))
+        wrapping_label(
+            i4,
+            "Ish stolida va Boshlash menyusida yorliq hosil qiladi. Yorliq "
+            "tasodifan o'chib ketsa yoki dastur boshqa papkaga ko'chirilsa "
+            "shu tugmani bosing."
+        ).pack(fill="x", pady=(0, 8))
+        ttk.Button(i4, text="Ish stoliga yorliq qo'yish", style="Ghost.TButton",
+                   command=self.do_shortcut).pack(anchor="w")
+
         c3, i3 = card(pad, "Dastur haqida")
         c3.pack(fill="x", pady=(10, 0))
         origins = self.info.get("origins") or {}
@@ -1435,6 +1568,26 @@ class App:
             "Saqlandi",
             "%d yil uchun ustama saqlandi.\n\nYangi narxlar kuchga kirishi "
             "uchun \"Qayta hisoblash\" tugmasini bosing." % ok)
+
+    def do_shortcut(self):
+        exe = app_exe_path()
+        if not exe:
+            messagebox.showinfo(
+                "Ishlab chiqish rejimi",
+                "Yorliq faqat .exe ishga tushirilganda yaratiladi.\n\n"
+                "Hozir dastur to'g'ridan-to'g'ri Python orqali ishlayapti.")
+            return
+        made = install_shortcuts()
+        if made:
+            messagebox.showinfo("Tayyor",
+                                "Yorliq yaratildi:\n\n%s" % "\n".join(made))
+        else:
+            messagebox.showerror(
+                "Bajarilmadi",
+                "Yorliq yaratilmadi. Antivirus yoki tashkilot siyosati "
+                "to'sgan bo'lishi mumkin.\n\n"
+                "Qo'lda: %s faylini o'ng tugma bilan bosib "
+                "\"Ish stoliga yuborish\" ni tanlang." % exe)
 
     def do_backup(self):
         p = DB.backup(C.db_path())
