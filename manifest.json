@@ -1,12 +1,12 @@
 {
-  "version": "2026.09.11-4",
-  "generated": "2026-09-11T10:58:34",
+  "version": "1.0.0",
+  "generated": "2026-09-11T11:01:30",
   "modules": [
     {
       "name": "bh_config",
       "path": "app/config.py",
-      "sha256": "7b3c18249337e94d17077f85138531d15b2a48aae72207bd27008588facee2f2",
-      "bytes": 17980
+      "sha256": "d83669b5c3d5dfb370845e1a440c08b0a135a0efe273c11cecc0afd5084c5062",
+      "bytes": 17973
     },
     {
       "name": "bh_db",

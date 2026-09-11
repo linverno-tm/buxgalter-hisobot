@@ -3,6 +3,21 @@
 Kirim (soliq.uz hisob-fakturalari) va chiqim (kassa cheklari) fayllarini
 o'qib, "КАМЕРАЛ ТЕКШИРУВЛАР" ko'rinishidagi Excel hisobotini yig'adi.
 
+## Buxgalterga yetkazish
+
+1. `build.bat` ni bir marta ishga tushiring -> `dist\BuxgalterHisobot.exe`
+2. Shu **bitta faylni** buxgalterga bering (Telegram, flesh, tarmoq papkasi - farqi yo'q)
+3. U faylni istalgan joyga qo'yib ishga tushiradi. O'rnatish, Python, admin huquqi kerak emas.
+
+Buxgalterda saqlanadigan narsalar:
+```
+%LOCALAPPDATA%\BuxgalterHisobot    hisobot.db          <- baza (butun tarix shu yerda)
+    backup\             <- avtomatik zaxira nusxalar
+    code\               <- GitHub'dan yuklangan kod keshi
+```
+
+`.exe` ni yangisiga almashtirsangiz ham baza joyida qoladi.
+
 ## Tuzilishi
 
 ```
@@ -29,6 +44,24 @@ Buxgalterda faqat `.exe` turadi. Har ochilganda:
 
 Tarmoq yo'q bo'lsa: kesh -> `.exe` ichidagi zaxira. Dastur hech qachon
 butunlay ishlamay qolmaydi.
+
+### Nega commit sha orqali
+
+`raw.githubusercontent.com/.../main/...` manzili GitHub CDN'ida **~5 daqiqa
+keshlanadi** - `git push` dan keyin darhol ochilsa eski kod keladi.
+`Cache-Control: no-cache` ham, `?t=123` parametri ham bu keshni kesmaydi
+(ikkalasi ham sinab ko'rilgan).
+
+Shuning uchun launcher avval eng so'nggi commit sha'ni aniqlaydi va
+**o'zgarmas** `raw.githubusercontent.com/.../<sha>/...` manzilidan yuklaydi -
+har commit uchun yangi URL, demak hech qachon eski bo'lmaydi.
+
+Sha qanday aniqlanadi:
+1. GitHub API (`/commits/main`) - keshlanmaydi, lekin soatiga 60 so'rov
+2. Atom feed (`/commits/main.atom`) - chegara yo'q, qisqa kesh bo'lishi mumkin
+3. Ikkalasi ham ishlamasa - oddiy `main` manzili (5 daqiqagacha kechikish)
+
+Amalda: buxgalter dasturni yopib-ochsa yangi kod keladi.
 
 ### Tuzatish chiqarish
 
