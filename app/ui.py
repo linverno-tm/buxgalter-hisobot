@@ -1028,9 +1028,12 @@ class App:
         c3, i3 = card(pad, "Dastur haqida")
         c3.pack(fill="x", pady=(10, 0))
         origins = self.info.get("origins") or {}
+        commit = self.info.get("commit")
         txt = ["Core versiya:  %s" % C.VERSION,
                "Launcher:      %s" % self.info.get("launcher_version", "-"),
-               "Yangilanish:   %s" % self.info.get("base_url", "-"), ""]
+               "Yangilanish:   %s" % self.info.get("base_url", "-"),
+               "Commit:        %s" % (commit[:12] if commit else "branch (5 daq. kechikishi mumkin)"),
+               ""]
         for k, v in origins.items():
             txt.append("  %-14s %s" % (k, v))
         ttk.Label(i3, text="\n".join(txt), style="CardMuted.TLabel",

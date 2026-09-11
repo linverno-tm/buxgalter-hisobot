@@ -32,9 +32,15 @@ LAUNCHER_VERSION = "1.0.0"
 # O'zgartirish uchun .exe yonida `update_url.txt` fayl yaratib, unga
 # to'liq raw-base URL yozish kifoya (qayta kompilyatsiya shart emas).
 # ---------------------------------------------------------------------------
-DEFAULT_BASE_URL = "https://raw.githubusercontent.com/linverno-tm/buxgalter-hisobot/main"
+REPO_OWNER = "linverno-tm"
+REPO_NAME = "buxgalter-hisobot"
+REPO_BRANCH = "main"
+
+DEFAULT_BASE_URL = "https://raw.githubusercontent.com/%s/%s/%s" % (
+    REPO_OWNER, REPO_NAME, REPO_BRANCH)
 
 NETWORK_TIMEOUT = 6  # soniya
+REF_TIMEOUT = 4      # commit sha ni aniqlash uchun (qisqaroq)
 
 # Modullar EXEC TARTIBI. manifest.json bo'lmasa shu ro'yxat ishlatiladi.
 FALLBACK_MODULES = [
@@ -113,6 +119,49 @@ def sha256_hex(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def resolve_fresh_base(log):
+    """
+    Eng so'nggi commit'ga bog'langan manzilni qaytaradi.
+
+    NEGA KERAK:
+      raw.githubusercontent.com/<owner>/<repo>/main/... manzili GitHub
+      CDN'ida ~5 daqiqa keshlanadi. `git push` dan keyin darhol ochilsa
+      ESKI kod keladi. "Cache-Control: no-cache" ham, "?t=123" ham
+      bu keshni kesmaydi - tekshirildi.
+
+      Lekin commit sha'ga bog'langan manzil O'ZGARMAS: har commit uchun
+      yangi URL, shuning uchun hech qachon eski bo'lmaydi.
+
+      Sha'ni olish uchun Atom feed ishlatiladi - GitHub API'dan farqli
+      o'laroq unda soatlik so'rov chegarasi yo'q (API 60/soat bilan
+      cheklangan va tez tugaydi).
+
+    Aniqlab bo'lmasa - oddiy branch manzili qaytadi (eng ko'pi 5 daqiqa
+    kechikish, dastur baribir ishlaydi).
+    """
+    if base_url() != DEFAULT_BASE_URL:
+        return base_url(), None          # qo'lda boshqa manzil ko'rsatilgan
+
+    try:
+        feed = http_get(
+            "https://github.com/%s/%s/commits/%s.atom"
+            % (REPO_OWNER, REPO_NAME, REPO_BRANCH),
+            timeout=REF_TIMEOUT,
+        ).decode("utf-8", "replace")
+        import re
+        m = re.search(r"/commit/([0-9a-f]{40})", feed)
+        if m:
+            sha = m.group(1)
+            log("  commit: %s (eng so'nggi)" % sha[:12])
+            return ("https://raw.githubusercontent.com/%s/%s/%s"
+                    % (REPO_OWNER, REPO_NAME, sha)), sha
+    except Exception as e:
+        log("  commit aniqlanmadi (%s), branch manzili ishlatiladi"
+            % type(e).__name__)
+
+    return base_url(), None
+
+
 # ---------------------------------------------------------------------------
 # Manba olish: tarmoq -> kesh -> zaxira
 # ---------------------------------------------------------------------------
@@ -133,13 +182,14 @@ def sanity_ok(text, rel_path):
     return True
 
 
-def fetch_source(rel_path, expected_sha, log):
+def fetch_source(rel_path, expected_sha, log, base=None):
     """(source_text, origin) qaytaradi. Hech narsa topilmasa (None, sabab)."""
     cache_path = os.path.join(cache_dir(), rel_path.replace("/", "__"))
+    base = base or base_url()
 
     # 1) Tarmoq
     try:
-        raw = http_get("%s/%s" % (base_url(), rel_path))
+        raw = http_get("%s/%s" % (base, rel_path))
         got = sha256_hex(raw)
         if expected_sha and got != expected_sha:
             log("  ! %s: sha256 mos kelmadi, rad etildi" % rel_path)
@@ -181,9 +231,10 @@ def fetch_source(rel_path, expected_sha, log):
     return None, "topilmadi"
 
 
-def load_manifest(log):
+def load_manifest(log, base=None):
+    base = base or base_url()
     try:
-        raw = http_get("%s/manifest.json" % base_url())
+        raw = http_get("%s/manifest.json" % base)
         m = json.loads(raw.decode("utf-8"))
         mods = [(x["name"], x["path"], x.get("sha256")) for x in m["modules"]]
         try:
@@ -222,13 +273,14 @@ def load_manifest(log):
 # Yuklash va ishga tushirish
 # ---------------------------------------------------------------------------
 def boot(log):
-    mods = load_manifest(log)
+    base, commit = resolve_fresh_base(log)
+    mods = load_manifest(log, base)
     origins = {}
     loaded = []
 
     for item in mods:
         name, rel, sha = (item + (None,))[:3] if len(item) == 2 else item
-        text, origin = fetch_source(rel, sha, log)
+        text, origin = fetch_source(rel, sha, log, base)
         if text is None:
             raise RuntimeError(
                 "'%s' moduli topilmadi (%s).\n\n"
@@ -259,7 +311,7 @@ def boot(log):
     ver = getattr(cfg, "VERSION", "?") if cfg else "?"
     log("  yuklandi: %d modul, core versiya %s" % (len(loaded), ver))
 
-    return ui, origins
+    return ui, origins, commit
 
 
 def show_fatal(msg):
@@ -305,7 +357,7 @@ def main():
     log("  manba: %s" % base_url())
 
     try:
-        ui, origins = boot(log)
+        ui, origins, commit = boot(log)
     except Exception as e:
         show_fatal("%s\n\n--- jurnal ---\n%s" % (e, "\n".join(lines)))
         return 1
@@ -315,6 +367,7 @@ def main():
             launcher_info={
                 "launcher_version": LAUNCHER_VERSION,
                 "base_url": base_url(),
+                "commit": commit,
                 "origins": origins,
                 "data_dir": data_dir(),
                 "cache_dir": cache_dir(),

@@ -6,13 +6,15 @@ L = importlib.util.module_from_spec(spec); spec.loader.exec_module(L)
 
 # Tarmoqni ataylab uzamiz
 L.DEFAULT_BASE_URL = "https://raw.githubusercontent.com/___yoq___/___yoq___/main"
+L.REPO_OWNER = "___yoq___"; L.REPO_NAME = "___yoq___"
+L.REF_TIMEOUT = 2
 L.NETWORK_TIMEOUT = 2
 os.environ.pop('BH_UPDATE_URL', None)
 
 log = []
 print("=== Tarmoq YO'Q, kesh YO'Q -> zaxiradan yuklanishi kerak ===")
 try:
-    ui, origins = L.boot(lambda s: (log.append(s), print('   ' + s))[1] if False else log.append(s))
+    ui, origins, commit = L.boot(lambda s: (log.append(s), print('   ' + s))[1] if False else log.append(s))
     for s in log: print('  ' + s)
     print()
     print('  bh_ui.main mavjud:', hasattr(ui, 'main'))
