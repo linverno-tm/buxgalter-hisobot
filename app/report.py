@@ -380,6 +380,19 @@ def generate(cx, out_path, years=None, owner_name=None, progress=None):
 
     owner_name = owner_name or DB.get_setting(cx, "owner_name", "Ташкилот")
 
+    # Hisobotdan oldin ombor majburan qayta hisoblanadi: qolda
+    # boglangan sotuvlar ham qoldiqdan ayrilsin (Qayta hisoblash
+    # tugmasi bosilmagan bolsa ham).
+    import bh_matching as _M
+    if progress:
+        progress(0, 0, 'ombor yangilanmoqda')
+    try:
+        _eng = _M.MatchEngine(cx)
+        _M.auto_match_all(cx, _eng)
+    except Exception:
+        pass
+    F.rebuild_stock(cx)
+
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     S = _styles(wb)
