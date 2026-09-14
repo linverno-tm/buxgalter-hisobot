@@ -11,7 +11,7 @@ import re
 import unicodedata
 from decimal import Decimal, ROUND_HALF_UP
 
-VERSION = "1.1.1"
+VERSION = "1.2.1"
 APP_TITLE = "Buxgalteriya hisoboti generatori"
 SCHEMA_VERSION = 1
 
@@ -460,6 +460,7 @@ ISSUE_TITLES = {
     "negative_qty": "Manfiy miqdor",
     "negative_cost": "Manfiy tannarx",
     "no_stock": "Omborda yetarli tovar yo'q (kirim hujjati topilmadi)",
+    "late_receipt": "Kirim hujjati sotuvdan keyingi sana bilan kiritilgan",
     "unmatched_sale": "Sotuv mahsuloti kirimga bog'lanmadi",
     "wrong_year": "Sana hisobot davriga tushmaydi",
     "bad_date": "Sana o'qilmadi",

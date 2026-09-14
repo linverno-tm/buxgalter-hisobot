@@ -673,6 +673,9 @@ class App:
         self._candidates = []
         self._products = []
         self._last_report = None
+        self._sha_cache = {}      # (yo'l, hajm, vaqt) -> (sha256, format)
+        self._stock_dirty = False  # qo'lda bog'landi, ombor qayta hisoblansin
+        self._stale = set()        # yangilanishi kerak bo'lgan og'ir bo'limlar
 
         root.title("%s - %s" % (C.APP_TITLE, C.VERSION))
         self._set_window_icon()
@@ -1201,14 +1204,40 @@ class App:
     # Yangilash
     # ==================================================================
     def refresh_all(self):
+        """
+        Yengil qismlar darrov, og'irlari esa bo'lim ochilganda.
+
+        Ilgari har amaldan keyin hamma jadval qaytadan hisoblanardi - shu
+        jumladan har yil uchun to'liq FIFO kesimi (year_rows). Bu interfeys
+        oqimida bajarilgani uchun oyna bir necha soniya qotib turardi,
+        holbuki foydalanuvchi ko'pincha bitta bo'limga qaraydi.
+        """
         self.refresh_counts()
         self.refresh_queue()
-        self.refresh_unmatched()
-        self.refresh_stock()
-        self.refresh_issues()
-        self.refresh_years()
-        self._search_products()
         self._refresh_db_label()
+        self._stale = {1, 2, 3, 4}
+        self._refresh_tab(self._current_tab())
+
+    def _current_tab(self):
+        try:
+            return self.nb.index(self.nb.select())
+        except tk.TclError:
+            return -1
+
+    def _refresh_tab(self, tab):
+        """Bitta bo'limni yangilaydi (kerak bo'lsa)."""
+        if tab not in self._stale:
+            return
+        self._stale.discard(tab)
+        if tab == 1:
+            self.refresh_unmatched()
+            self._search_products()
+        elif tab == 2:
+            self.refresh_stock()
+        elif tab == 3:
+            self.refresh_years()
+        elif tab == 4:
+            self.refresh_issues()
 
     def refresh_counts(self):
         st = DB.stats(self.cx)
@@ -1218,18 +1247,36 @@ class App:
                     st["lines_in"] + st["lines_out"],
                     st["products"], st["unmatched"], st["issues"]))
 
+    def _file_info(self, path, stt):
+        """
+        Faylning sha256 i va formati; (yo'l, hajm, o'zgargan vaqt) bo'yicha
+        keshlanadi.
+
+        Ilgari navbat har yangilanganda (fayl qo'shilganda, tur almashganda,
+        har amaldan keyin) HAR BIR fayl boshidan oxirigacha qayta o'qilardi.
+        O'nlab fayl tashlansa oyna shu paytda qotib turardi.
+        """
+        key = (os.path.normcase(os.path.abspath(path)), stt.st_size,
+               int(stt.st_mtime))
+        got = self._sha_cache.get(key)
+        if got is None:
+            got = (DB.file_sha256(path), P.sniff(path))
+            self._sha_cache[key] = got
+        return got
+
     def refresh_queue(self):
         rows = []
         for p, kind in self.queued_files:
             try:
-                size = os.path.getsize(p)
-                sha = DB.file_sha256(p)
+                stt = os.stat(p)
+                sha, fmt = self._file_info(p, stt)
+                size = stt.st_size
                 ex = DB.find_source_file(self.cx, sha)
                 state = ("Allaqachon kiritilgan (%s)" % (ex["imported_at"] or "")[:10]) \
                     if ex else "Yangi"
             except OSError:
-                size, state = 0, "Fayl ochilmadi"
-            rows.append((os.path.basename(p), kind, P.sniff(p),
+                size, fmt, state = 0, "?", "Fayl ochilmadi"
+            rows.append((os.path.basename(p), kind, fmt,
                          "%.0f KB" % (size / 1024.0), state))
 
         def tag(r):
@@ -1567,6 +1614,8 @@ class App:
         grp = self._unmatched[ui]
         self.engine.confirm(grp["line_id"], pid, grp["raw_name"])
         name = self.engine.products.get(pid, {}).get("canon_name", "?")
+        self._stock_dirty = True
+        self._stale.update({2, 3})
         self.set_status("Bog'landi: %s  ->  %s" % ((grp["raw_name"] or "")[:40],
                                                    name[:40]))
         self.refresh_unmatched()
@@ -1574,8 +1623,8 @@ class App:
         if not self._unmatched:
             messagebox.showinfo(
                 "Tugadi",
-                "Barcha sotuvlar bog'landi.\n\n\"Qayta hisoblash\" tugmasini "
-                "bosib tannarxni yangilang.")
+                "Barcha sotuvlar bog'landi.\n\nOmbor avtomatik qayta "
+                "hisoblanadi - hisobotda sotilgan tovar qoldiqdan ayriladi.")
 
     def save_markups(self):
         ok = 0
@@ -1642,14 +1691,28 @@ class App:
             tab = self.nb.index(self.nb.select())
         except tk.TclError:
             return
-        if tab == 1:
+        if self._recalc_if_dirty():
+            return
+        if tab in self._stale:
+            self._refresh_tab(tab)
+        elif tab == 1:
             self.refresh_unmatched()
-        elif tab == 2:
-            self.refresh_stock()
-        elif tab == 3:
-            self.refresh_years()
-        elif tab == 4:
-            self.refresh_issues()
+
+    def _recalc_if_dirty(self):
+        """
+        Qo'lda bog'langandan keyin omborni o'zi qayta hisoblaydi.
+
+        Buxgalter "Qayta hisoblash" tugmasini bosishni eslab o'tirmasin:
+        "Ombor" yoki "Hisobot" bo'limi ochilganda raqamlar o'zi yangilanadi.
+        """
+        if not self._stock_dirty or not getattr(self, "worker", None) \
+                or self.worker.busy:
+            return False
+        if self._current_tab() not in (2, 3):
+            return False
+        self._stock_dirty = False
+        self.do_recalc()
+        return True
 
     def _on_unmatched_select(self, _e=None):
         i = self.tbl_unmatched.selected_index()
@@ -1709,6 +1772,9 @@ class App:
             pass
         self.cx = DB.connect()
         self.engine = M.MatchEngine(self.cx)
+        # Import / Qayta hisoblash / Hisobot - uchalasi ham FIFO ni qayta
+        # quradi, demak ombor yangi.
+        self._stock_dirty = False
 
         if label == "Import":
             self.queued_files = []

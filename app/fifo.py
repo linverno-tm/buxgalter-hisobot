@@ -35,6 +35,22 @@ def import_parsed(cx, engine, parsed, source_file_id, on_issue=None):
     """
     added = skipped = nlines = 0
 
+    # Ulanish avtokommit rejimida (isolation_level=None), ya'ni har INSERT
+    # alohida tranzaksiya bo'lib ketadi. Minglab satrda bu eng katta
+    # sekinlik - shuning uchun hammasi bitta tranzaksiyaga o'raladi.
+    cx.execute("BEGIN")
+    try:
+        added, skipped, nlines = _import_docs(cx, engine, parsed, source_file_id)
+        cx.execute("COMMIT")
+    except Exception:
+        cx.execute("ROLLBACK")
+        raise
+    return added, skipped, nlines
+
+
+def _import_docs(cx, engine, parsed, source_file_id):
+    added = skipped = nlines = 0
+
     for doc in parsed["documents"]:
         ex = cx.execute("SELECT id FROM document WHERE doc_key=?",
                         (doc["doc_key"],)).fetchone()
@@ -117,10 +133,43 @@ def rebuild_stock(cx, progress=None):
     qayta o'ynatiladi - shuning uchun yil chegarasi hech qanday ahamiyatga
     ega emas, qoldiq o'z-o'zidan o'tadi.
     """
+    cx.execute("BEGIN")
+    try:
+        res = _rebuild(cx, progress)
+        cx.execute("COMMIT")
+    except Exception:
+        cx.execute("ROLLBACK")
+        raise
+    return res
+
+
+def _rebuild(cx, progress=None):
+    """
+    Ombor ikki bosqichda qayta quriladi.
+
+    NEGA IKKI BOSQICH. Ilgari kirim va chiqim BITTA zanjirda, sana bo'yicha
+    aralash o'ynatilardi. Natijada sotuv sanasi faktura sanasidan oldin
+    bo'lsa (buxgalter fakturani keyinroq kiritsa yoki soliq.uz fakturani
+    keyin bersa), o'sha paytda ochiq partiya topilmasdi va sotuv "omborda
+    yo'q" deb belgilanardi - holbuki tovar omborda bor edi. Partiyadan
+    hech narsa yechilmagani uchun qoldiq ham kamaymasdi.
+
+    Endi:
+      1-bosqich - barcha kirim partiyalari yaratiladi;
+      2-bosqich - sotuvlar sana tartibida yechiladi:
+            a) sotuv sanasida ochiq bo'lgan partiyalardan (haqiqiy FIFO);
+            b) topilmasa - SHU YIL ichidagi keyingi kirimdan (ogohlantirish
+               bilan: sana tartibi teskari, lekin tovar davr ichida bor);
+            c) butun davrda ham bo'lmasa - "omborda yo'q" (kirim hujjati
+               umuman yetishmaydi).
+
+    (b) qoidasi buxgalterning talabi: "товар чиқим қилинганда омборда
+    мавжуд товар қолдиғидан чиқим қилиш керак".
+    """
     cx.execute("DELETE FROM allocation")
     cx.execute("DELETE FROM stock_lot")
     DB.clear_issues(cx, codes=["no_stock", "negative_cost", "negative_qty",
-                               "unmatched_sale", "unit_mismatch"])
+                               "unmatched_sale", "unit_mismatch", "late_receipt"])
 
     rows = cx.execute("""
         SELECT l.id, l.kind, l.product_id, l.qty, l.unit_price_net,
@@ -136,43 +185,90 @@ def rebuild_stock(cx, progress=None):
     """).fetchall()
 
     total = len(rows)
-    # product_id -> ochiq partiyalar ro'yxati [ [lot_id, qty_left, unit_cost], ... ]
+    # product_id -> partiyalar [ [lot_id, qty_left, unit_cost, lot_date], ... ]
     open_lots = {}
     last_cost = {}
-    n_alloc = n_short = 0
+    n_alloc = n_short = n_late = 0
+    allocs = []          # bitta executemany uchun to'planadi
+    shorts = []          # ombor yetmagan satrlar
+    touched = {}         # lot_id -> oxirgi qty_left
 
-    for i, r in enumerate(rows):
+    # =======================================================================
+    # 1-BOSQICH: kirim partiyalari
+    # =======================================================================
+    sales = []
+    for r in rows:
+        if r["kind"] != "kirim":
+            sales.append(r)
+            continue
+
         pid = r["product_id"]
         q = DB.D(r["qty"])
         dt = r["dt"] or ""
         year = r["doc_year"]
 
-        if r["kind"] == "kirim":
-            if q <= 0:
-                DB.add_issue(cx, year, C.SEVERITY_WARN, "negative_qty",
-                             "Kirim miqdori musbat emas: %s (%s)" % (q, r["raw_name"]),
-                             "doc_line", r["id"])
-                continue
-            cost = DB.D(r["unit_price_net"])
-            if cost < 0:
-                DB.add_issue(cx, year, C.SEVERITY_ERROR, "negative_cost",
-                             "Manfiy tannarx %s: %s" % (cost, r["raw_name"]),
-                             "doc_line", r["id"])
-                cost = -cost
-            if cost == 0:
-                DB.add_issue(cx, year, C.SEVERITY_WARN, "missing_price",
-                             "Kirim narxi nol: %s" % r["raw_name"], "doc_line", r["id"])
-            markup = DB.get_markup(cx, year or 0, r["product_id"] and None, r["partner_tin"])
-            cur = cx.execute(
-                "INSERT INTO stock_lot(product_id,doc_line_id,lot_date,lot_year,"
-                "qty_in,qty_left,unit_cost,markup,is_opening,source_year) "
-                "VALUES(?,?,?,?,?,?,?,?,0,?)",
-                (pid, r["id"], dt, year, str(q), str(q), str(cost), str(markup), year))
-            open_lots.setdefault(pid, []).append([cur.lastrowid, q, cost])
-            last_cost[pid] = cost
+        if q <= 0:
+            DB.add_issue(cx, year, C.SEVERITY_WARN, "negative_qty",
+                         "Kirim miqdori musbat emas: %s (%s)" % (q, r["raw_name"]),
+                         "doc_line", r["id"])
             continue
+        cost = DB.D(r["unit_price_net"])
+        if cost < 0:
+            DB.add_issue(cx, year, C.SEVERITY_ERROR, "negative_cost",
+                         "Manfiy tannarx %s: %s" % (cost, r["raw_name"]),
+                         "doc_line", r["id"])
+            cost = -cost
+        if cost == 0:
+            DB.add_issue(cx, year, C.SEVERITY_WARN, "missing_price",
+                         "Kirim narxi nol: %s" % r["raw_name"], "doc_line", r["id"])
+        markup = DB.get_markup(cx, year or 0, None, r["partner_tin"])
+        cur = cx.execute(
+            "INSERT INTO stock_lot(product_id,doc_line_id,lot_date,lot_year,"
+            "qty_in,qty_left,unit_cost,markup,is_opening,source_year) "
+            "VALUES(?,?,?,?,?,?,?,?,0,?)",
+            (pid, r["id"], dt, year, str(q), str(q), str(cost), str(markup), year))
+        open_lots.setdefault(pid, []).append([cur.lastrowid, q, cost, dt])
+        last_cost[pid] = cost
 
-        # --- chiqim ---
+    # =======================================================================
+    # 2-BOSQICH: sotuvlar
+    # =======================================================================
+    def _consume(lots, need, sale_line_id, pid, dt, year, only_future_of_year=None):
+        """
+        Partiyalardan yechadi va qolgan ehtiyojni qaytaradi.
+
+        only_future_of_year=None -> sotuv sanasida OCHIQ partiyalar
+        only_future_of_year=YYYY -> sotuvdan KEYIN kelgan, lekin shu yildagi
+        """
+        nonlocal n_alloc
+        for lot in lots:
+            if need <= 0:
+                break
+            if lot[1] <= 0:
+                continue
+            ld = lot[3] or ""
+            if only_future_of_year is None:
+                # sanasi yo'q partiya har doim mavjud deb qaraladi
+                if ld and dt and ld > dt:
+                    continue
+            else:
+                if not (ld and dt and ld > dt and ld[:4] == only_future_of_year):
+                    continue
+            take = lot[1] if lot[1] <= need else need
+            allocs.append((sale_line_id, lot[0], pid, dt, year, str(C.qty(take)),
+                           str(lot[2]), str(C.money(take * lot[2]))))
+            n_alloc += 1
+            lot[1] -= take
+            need -= take
+            touched[lot[0]] = lot[1]        # qty_left oxirida bir marta yoziladi
+        return need
+
+    for i, r in enumerate(sales):
+        pid = r["product_id"]
+        q = DB.D(r["qty"])
+        dt = r["dt"] or ""
+        year = r["doc_year"]
+
         if q == 0:
             continue
         if q < 0:
@@ -185,43 +281,40 @@ def rebuild_stock(cx, progress=None):
                 "VALUES(?,?,?,?,?,?,?,?,0,?)",
                 (pid, r["id"], dt, year, str(back), str(back), str(cost),
                  str(DB.get_markup(cx, year or 0)), year))
-            open_lots.setdefault(pid, []).insert(0, [cur.lastrowid, back, cost])
+            open_lots.setdefault(pid, []).insert(0, [cur.lastrowid, back, cost, dt])
             continue
 
-        need = q
         lots = open_lots.get(pid, [])
-        while need > 0 and lots:
-            lot = lots[0]
-            take = lot[1] if lot[1] <= need else need
-            if take > 0:
-                cx.execute(
-                    "INSERT INTO allocation(sale_line_id,stock_lot_id,product_id,"
-                    "alloc_date,alloc_year,qty,unit_cost,cost_amount,shortfall) "
-                    "VALUES(?,?,?,?,?,?,?,?,0)",
-                    (r["id"], lot[0], pid, dt, year, str(C.qty(take)),
-                     str(lot[2]), str(C.money(take * lot[2]))))
-                n_alloc += 1
-                lot[1] -= take
-                need -= take
-                cx.execute("UPDATE stock_lot SET qty_left=? WHERE id=?",
-                           (str(C.qty(lot[1])), lot[0]))
-            if lot[1] <= 0:
-                lots.pop(0)
 
+        # a) sotuv sanasida ochiq partiyalardan
+        need = _consume(lots, q, r["id"], pid, dt, year)
+
+        # b) topilmasa - shu yil ichidagi keyingi kirimdan
         if need > 0:
-            # Omborda yo'q. MANFIYGA TUSHIRMAYMIZ - belgilab qo'yamiz.
+            ysale = (dt[:4] if dt else None) or (str(year) if year else None)
+            if ysale:
+                before = need
+                need = _consume(lots, need, r["id"], pid, dt, year,
+                                only_future_of_year=ysale)
+                if need < before:
+                    n_late += 1
+                    DB.add_issue(
+                        cx, year, C.SEVERITY_WARN, "late_receipt",
+                        "%s: %s dona %s da sotilgan, kirim hujjati kechroq sana "
+                        "bilan kiritilgan - davr ichidagi kirimdan yechildi"
+                        % ((r["raw_name"] or "?")[:60], C.qty(before - need),
+                           dt or "?"), "doc_line", r["id"])
+
+        # c) butun davrda ham yo'q
+        if need > 0:
             est = last_cost.get(pid)
             if est is None:
                 gross = DB.D(r["amount_gross"])
                 mk = DB.get_markup(cx, year or 0)
                 est = C.money(C.net_from_gross(gross / q if q else 0) / (1 + mk)) \
                     if q else ZERO
-            cx.execute(
-                "INSERT INTO allocation(sale_line_id,stock_lot_id,product_id,"
-                "alloc_date,alloc_year,qty,unit_cost,cost_amount,shortfall) "
-                "VALUES(?,NULL,?,?,?,?,?,?,1)",
-                (r["id"], pid, dt, year, str(C.qty(need)), str(est),
-                 str(C.money(need * est))))
+            shorts.append((r["id"], pid, dt, year, str(C.qty(need)), str(est),
+                           str(C.money(need * est))))
             n_short += 1
             DB.add_issue(
                 cx, year, C.SEVERITY_ERROR, "no_stock",
@@ -229,10 +322,26 @@ def rebuild_stock(cx, progress=None):
                 "Tannarx taxminiy: %s" % ((r["raw_name"] or "?")[:60], C.qty(need), est),
                 "doc_line", r["id"])
 
-        if progress and (i % 200 == 0 or i == total - 1):
-            progress(i + 1, total)
+        if progress and (i % 500 == 0 or i == len(sales) - 1):
+            progress(i + 1, len(sales))
 
-    return {"lines": total, "allocations": n_alloc, "shortfalls": n_short}
+    # --- to'plangan yozuvlar bir zarbda ---
+    if allocs:
+        cx.executemany(
+            "INSERT INTO allocation(sale_line_id,stock_lot_id,product_id,"
+            "alloc_date,alloc_year,qty,unit_cost,cost_amount,shortfall) "
+            "VALUES(?,?,?,?,?,?,?,?,0)", allocs)
+    if shorts:
+        cx.executemany(
+            "INSERT INTO allocation(sale_line_id,stock_lot_id,product_id,"
+            "alloc_date,alloc_year,qty,unit_cost,cost_amount,shortfall) "
+            "VALUES(?,NULL,?,?,?,?,?,?,1)", shorts)
+    if touched:
+        cx.executemany("UPDATE stock_lot SET qty_left=? WHERE id=?",
+                       [(str(C.qty(q)), lid) for lid, q in touched.items()])
+
+    return {"lines": total, "allocations": n_alloc, "shortfalls": n_short,
+            "late": n_late}
 
 
 # ===========================================================================
